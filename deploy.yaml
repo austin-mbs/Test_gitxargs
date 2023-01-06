@@ -1,0 +1,132 @@
+name: deploy
+
+'on':
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      environment_url_slug:
+        required: true
+        type: string
+      compendium_api_key:
+        required: true
+        type: string
+      debug:
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      access_key_id:
+        required: true
+      secret_access_key:
+        required: true
+      oauth_key:
+        required: true
+      oauth_secret:
+        required: true
+      benchling_key:
+        required: true
+
+env:
+  DISCO_PORTAL_ROOT_DOMAIN: mammothbio.net
+  COMPENDIUM_ROOT_DOMAIN: mammothbio.net
+  AWS_DEFAULT_REGION: us-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-20.04
+
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: system-deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --allow-downgrades libssl-dev libcurl4-openssl-dev python3-dev libmysqlclient21=8.0.19-0ubuntu5 libmysqlclient-dev=8.0.19-0ubuntu5
+
+      - name: setup python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.8.5'
+
+      - name: load pip cache
+        uses: actions/cache@v3
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt', 'requirements_dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+            ${{ runner.os }}-
+
+      - name: install pip deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_dev.txt --upgrade
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: '14'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: install js deps
+        run: |
+          npm i -g npm@8.3.1
+          npm --prefix frontend ci
+
+      - name: collect static files
+        run: |
+          make collectstatic
+
+      - name: install eb
+        run: |
+          python -m venv ~/.ebvenv
+          source ~/.ebvenv/bin/activate
+          pip install --upgrade pip wheel
+          pip install awsebcli boto3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.access_key_id }}
+          aws-secret-access-key: ${{ secrets.secret_access_key }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: eb setup
+        run: |
+          mkdir .elasticbeanstalk
+          cat << EOF >> .elasticbeanstalk/config.yml
+          global:
+            application_name: disco-portal-internal-${ENVIRONMENT}
+            default_platform: Python 3.8 running on 64bit Amazon Linux 2
+            default_region: $AWS_DEFAULT_REGION
+            workspace_type: Application
+          EOF
+
+      - name: set env
+        run: |
+          echo "CI_COMMIT_SHORT_SHA=${GITHUB_SHA::8}" >> $GITHUB_ENV
+
+      - name: env var generate
+        env:
+          SOCIAL_AUTH_GOOGLE_OAUTH2_KEY: ${{ secrets.oauth_key }}
+          SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET: ${{ secrets.oauth_secret }}
+          BENCHLING_API_KEY: ${{ secrets.benchling_key }}
+          DISCO_PORTAL_URL: disco${{ inputs.environment_url_slug }}.${{ env.DISCO_PORTAL_ROOT_DOMAIN }}
+          COMPENDIUM_URL: https://compendium${{ inputs.environment_url_slug }}.${{ env.COMPENDIUM_ROOT_DOMAIN }}
+          COMPENDIUM_API_KEY: ${{ inputs.compendium_api_key }}
+          DEBUG: ${{ inputs.debug }}
+        run: |
+          source ~/.ebvenv/bin/activate
+          python aws/env_var_manager.py
+
+      - name: eb deploy
+        run: |
+          source ~/.ebvenv/bin/activate
+          eb deploy disco-portal-amz2-py3-internal-${ENVIRONMENT}
